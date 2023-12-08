@@ -1,0 +1,160 @@
+pipeline {
+  agent {
+
+    docker {
+      image 'abhishekf5/maven-abhishek-docker-agent:v1'
+      args '--user root -v /var/run/docker.sock:/var/run/docker.sock' // mount Docker socket to access the host's Docker daemon
+    }
+  }
+   environment{
+        VERSION = "${env.BUILD_ID}"
+    }
+ 
+ 
+  stages {
+     stage('git-secrets') {
+           steps {
+                   sh 'rm trufflehog || true'
+                    sh 'docker run gesellix/trufflehog --json https://github.com/isekai-003/argocd.git > trufflehog'
+                  }
+       }
+    stage('Checkout') {
+      steps {
+        sh 'echo passed'
+          git branch: 'main', url: 'https://github.com/isekai-003/argocd.git'
+      }
+    }
+    stage('compile') {
+      steps {
+      sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && mvn compile'
+      }
+    }
+    stage('Test stage') {
+      steps {
+      sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && mvn test'
+      }
+    }
+    
+     stage('Static Code Analysis') {
+      environment {
+        SONAR_URL = "http://3.109.153.51:9000"
+      }
+      steps {
+        withSonarQubeEnv('sonar-server') {
+                  withCredentials([string(credentialsId: 'sonar', variable: 'SONAR_AUTH_TOKEN')]) {
+                  sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && mvn sonar:sonar -Dsonar.login=$SONAR_AUTH_TOKEN -Dsonar.host.url=${SONAR_URL}'
+                  }
+        
+        }
+      }
+    }
+    stage('quality-gate-status') {
+      steps {
+        script {
+
+             
+             waitForQualityGate abortPipeline: false, credentialsId: 'sonar'
+            
+        }
+      }
+    }
+    stage('Build stage') {
+      steps {
+        sh 'ls -ltr'
+        // build the project and create a JAR file
+        sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && mvn clean install'
+      }
+    }
+    
+    stage('Build and Push Docker Image to Nexus') {
+      environment {
+        DOCKER_IMAGE = "shamshuddin03/ultimate-cicd:${BUILD_NUMBER}"
+        // DOCKERFILE_LOCATION = "java-maven-sonar-argocd-helm-k8s/spring-boot-app/Dockerfile"
+        REGISTRY_CREDENTIALS = credentials('docker')
+      }
+      steps {
+        script {
+            sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && docker build -t ${DOCKER_IMAGE} .'
+            
+            sh '''
+             docker tag ${DOCKER_IMAGE} 52.66.183.147:8083/${DOCKER_IMAGE}
+             docker login -u admin -p akshay 52.66.183.147:8083
+             docker push 52.66.183.147:8083/${DOCKER_IMAGE}
+             docker rmi 52.66.183.147:8083/${DOCKER_IMAGE}
+            
+
+             '''
+        }
+      }
+    }
+     stage("pushing the helm charts to nexus"){
+             steps{
+                 script{
+                    
+                           dir('spring-boot-app-manifests/') {
+                                
+                              sh '''
+                                 curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
+                                 chmod 700 get_helm.sh
+                                 ./get_helm.sh
+                                 
+                                helmversion=$( helm show chart myapp | grep version | cut -d: -f 2 | tr -d ' ')
+                                 
+                                tar -czvf  myapp-${helmversion}.tgz myapp/
+                           
+                                 curl -u admin:akshay http://52.66.183.147:8081/repository/helm-hosted/ --upload-file myapp-${helmversion}.tgz -v
+
+                             '''
+                           }
+                    
+                 }
+             }
+         }
+     stage('identifying misconfigs using datree in helm charts') {
+       steps {
+         script {
+           dir('spring-boot-app-manifests/myapp/') {
+              sh 'curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3'
+               sh 'chmod 700 get_helm.sh'
+              sh './get_helm.sh'
+             
+                  sh  'helm datree test myapp/'
+           }
+         }
+       }
+     }
+        stage('Docker-image-Scan') {
+            steps {
+                // Install trivy
+                 sh 'curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.18.3'
+       
+
+                sh 'mkdir -p reports'
+                sh 'trivy image shamshuddin03/ultimate-cicd:${BUILD_NUMBER}'
+                   
+
+            }
+        }   
+        stage('Update Deployment File') {
+        environment {
+            GIT_REPO_NAME = "argocd"
+            GIT_USER_NAME = "isekai-003"
+        }
+        steps {
+            withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
+                sh '''
+                    git config user.email "shamshuddin0003@gmail.com"
+                    git config user.name "isekai-003"
+                    BUILD_NUMBER=${BUILD_NUMBER}
+                    sed -i "s/replaceImageTag/${BUILD_NUMBER}/g" java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml
+                    git add java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml
+                    git commit -m "Update deployment image to version ${BUILD_NUMBER}"
+                    git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:main
+                '''
+            }
+        }
+    }
+    
+
+  }
+}
